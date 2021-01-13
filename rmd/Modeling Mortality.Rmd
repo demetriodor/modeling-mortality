@@ -1,0 +1,924 @@
+---
+title: "Modeling Mortality with R"
+author: Dimiter Toshkov (@DToshkov)
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+
+output: 
+  html_document:
+    theme: default
+    self_contained: yes
+    toc: yes
+    toc_float: true
+---
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(metathis)
+meta() %>%
+  meta_general(
+    robots = "index,follow",
+    subject = "Modeling mortality"
+  ) %>%
+  meta_description(
+    "How to model mortality data with R"
+  ) %>% 
+  meta_name("github-repo" = "demetriodor/ESSwithR",
+            "keywords" = 'mortality, prediction, covid-19, covid 19, covid, pandemic, excess mortality, corona virus, deaths'
+  ) %>% 
+  meta_viewport() %>% 
+  meta_social(
+    title = "Modeling Mortality",
+    url = "http://dimiter.eu/Visualizations_files/Mortality.html",
+    og_type = "article",
+    og_author = c("Dimiter Toshkov"),
+    og_site_name = 'http://dimiter.eu',
+    twitter_card_type = "summary",
+    twitter_creator = "@DToshkov"
+  )
+```
+
+<style type="text/css">
+  div.main-container {
+    max-width: 1680px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+code{
+  font-size: 16px;
+}
+
+code.r{
+  font-size: 14px;
+}
+
+pre {
+  font-size: 14px
+}
+
+</style>
+  
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 1280)
+```
+&nbsp;
+
+# Introduction
+<font size="3">
+To grasp the true impact of COVID-19 on our societies, we need to know the effect of the pandemic on mortality. In other words, we need to know how many deaths can be attributed to the virus, directly and indirectly^[There is a difference between the total number of deaths that have been caused by COVID-19 and population-level impact of COVID-19 on mortality, as I explain in this [post](http://re-design.dimiter.eu/?p=1046). The statistical approach adopted in this document aims to identify the population-level impact.]. 
+
+It is already popular to visualize mortality in order to gauge the impact of the pandemic in different countries. You might have seen at least some of these graphs and websites: [FT](https://www.ft.com/content/a2901ce8-5eb7-4633-b89c-cbdf5b386938), 
+[Economist](https://www.economist.com/graphic-detail/2020/07/15/tracking-covid-19-excess-deaths-across-countries), [Our World in Data](https://ourworldindata.org/excess-mortality-covid), [CBS](https://www.cbs.nl/en-gb/news/2020/48/less-excess-mortality-during-second-wave-but-still-high-after-9-weeks/expected-mortality), [EFTA](https://www.efta.int/Publications/news/COVID-19-Excess-Mortality-Selected-European-Countries-521261), [CDC](https://www.cdc.gov/nchs/nvss/vsrr/covid19/excess_deaths.htm), [EUROSTAT](https://ec.europa.eu/eurostat/statistics-explained/index.php?title=Excess_mortality_-_statistics&oldid=509982), and [EUROMOMO](https://www.euromomo.eu/). But estimating the impact of COVID-19 on mortality is also controversial, with people either misunderstanding or distrusting the way in which the impact is measured and assessed.
+
+In this document, I show step-by-step how we can estimate the impact of COVID-19 on mortality. I build a large number of statistical models that we can use to predict expected mortality in 2020. The complexity of the models ranges from the simplest, based only on weekly averages from past years, to what is currently the state of the art. 
+
+But this is not all. What I also do is review the predictive performance of all of these models, so that we know which ones work best. I run the models on publicly available data from the Netherlands, I use only the open software `R`, and I share the code, so anyone can check, replicate and extend the exercise. 
+
+I hope this document  will provide some transparency about how expected mortality is and can be estimated from data and how it can be used to identify the effect of the pandemic. Feel free to try different estimation strategies, adapt the code to data from different countries, or use different measures to compare the performance of the models.
+
+# Excess mortality
+Before we begin, let's get on the same page with regard to our main concepts. To estimate the effect of COVID-19 on mortality, we rely on the concept of **excess mortality**, which is defined as the observed number of deaths over a period of time minus the number of deaths we expected to observe. Clearly, this implies that we need to estimate the **expected** mortality that we would have observed in the absence of the pandemic. 
+
+How do we estimate expected mortality? Simply put, we extrapolate (predict) from the observed past trends in mortality, possibly adding contemporaneous data (for example, temperature) to aid the predictions. In short, we fit statistical models to data from the past, and we extrapolate from these models for 2020. We can fit many different statistical models to the past data, each making different decisions about what features of the data to use, and how. Some of these models will make better predictions than others, so it is important to compare their predictive performance before we settle on the one or several models we will use to calculate excess mortality.
+
+# Getting the data
+### Mortality data
+First, we need to obtain data on mortality. The Dutch statistical institute CBS provides regularly updated data on deaths from all causes in the country. The data is accessible directly from within `R` using the `cbsodataR` package. Here is the code to get the relevant mortality dataset. This dataset starts in the beginning of 1995 and the latest available week (at the time of writing) is Week 52 of 2020. We also load the packages we gonna use for working with the data.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(cbsodataR)
+library(xts)
+library(utils)
+library(httr)
+
+# Get the mortality dataset
+all.deaths <- cbs_get_data('70895ned') %>% # specify the dataset id
+  cbs_add_label_columns() %>%
+  mutate (year = as.numeric(as.character(substr(Perioden, 1, 4))), # extract the year
+          week = as.numeric(as.character(substr(Perioden, 7,8))), # extract the week
+          year.month = format(strptime(paste(year, week, 1), format = "%Y %W %u"),"%Y.%m"), # make a year.month index
+          filter_n = as.character(substr(Perioden, 5,6)), # will be used for filtering out
+          deaths = Overledenen_1, # rename column
+          n_days = trimws(gsub("\\(", "", substr(Perioden_label, 14, 15))), # this gets the number of days in the week
+          n_days = as.numeric(as.character(ifelse (nchar(n_days)==0, 7, n_days))), # usually 7, but not always for weeks 0, 1, 52 and 53; rescale
+          week = case_when(week == 0 ~ 1, week == 53 ~ 52, TRUE ~ week) # recode weeks 0 and 53 to 1 and 52
+          ) %>% 
+  filter(filter_n != 'JJ')  # remove yearly totals
+  
+# Make function to filter and aggregate the data
+data.prep <- function (sex, age_group){
+  deaths.temp <- all.deaths %>% 
+    filter (Geslacht == sex, LeeftijdOp31December == age_group) %>% 
+    dplyr::select (year, week, year.month, deaths, n_days) %>% 
+    mutate (index = paste0(year, '.', week)) %>% 
+    group_by (index) %>% # this is needed for weeks 1 and 52
+    summarize(year=mean(year), week=mean(week), deaths = sum(deaths), year.month = first (year.month), n_days = sum(n_days)-7) %>%  
+    dplyr::select (-index)  %>% 
+    arrange(year, week)
+  } 
+
+# Apply the function to get all deaths
+deaths <- data.prep(sex = 1100, age_group = 10000) # all deaths
+
+# We can also use the function to get deaths for specific sex and age groups
+deaths.m <- data.prep(sex = 3000, age_group = 10000) # men only   
+deaths.w <- data.prep(sex = 4000, age_group = 10000) # women only   
+deaths.80plus <- data.prep(sex = 1100, age_group = 21700) # all, 80+ deaths
+deaths.65to80 <- data.prep(sex = 1100, age_group = 53950) # all, 65 to 80 deaths
+deaths.0to65 <- data.prep(sex = 1100, age_group = 41700) # all, 0 to 65 deaths
+deaths.m.80plus <- data.prep(sex = 3000, age_group = 21700) # men, 80+ deaths
+deaths.m.65to80 <- data.prep(sex = 3000, age_group = 53950) # men, 65 to 80 deaths
+deaths.m.0to65 <- data.prep(sex = 3000, age_group = 41700) # men, 0 to 65 deaths
+deaths.w.80plus <- data.prep(sex = 4000, age_group = 21700) # women, 80+ deaths
+deaths.w.65to80 <- data.prep(sex = 4000, age_group = 53950) # women, 65 to 80 deaths
+deaths.w.0to65 <- data.prep(sex = 4000, age_group = 41700) # women, 0 to 65 deaths
+```
+
+As you can see, getting the mortality data per week for the Netherlands is quite straightforward. But if you don't want to bother with getting the data yourself, you can access the complete dataset used in the analysis [here](http://github.com). 
+
+There is only one complication that creates a lot of nuisance: some weeks start with Week 0 rather than Week 1, few years end with Week 53 rather than Week 52, and some years have incomplete Week 1 and Week 52. We can ignore that (as almost everyone else does), but we can also tackle the complication head on. To do so, we recode weeks 0 and 53 to 1 and 52 respectively, then we aggregate the data so that these weeks feature only once in the resulting dataset, and - most importantly - we create a variable that tracks the number of days in the week, which will be the same for all weeks between 2 and 51, but will differ for weeks 1 and 52. In this way we keep the abnormal starting and ending weeks of the year in the data, but we will be able to account for their unequal length when we analyze the data.
+
+### Annual population data
+We will also need the total population data for the country, so let's get it from the same source. In addition to the total population, we can extract the population by sex and age groups. Since the data for 2020 is not yet available, we extrapolate from the last observed values.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+# Get the population table
+all.pop <- cbs_get_data('7461eng') %>%
+  cbs_add_label_columns() %>%
+  mutate (pop = TotalPopulation_1 / 1e6, # divide by a million
+          year = as.numeric(as.character(Periods_label))) %>%
+  filter (year > 1994) %>%
+  dplyr::select (Sex_label, Age_label, year, pop)
+
+# Make function to filter data
+pop.data.prep <- function (sex, age_group){
+  pop.temp <- all.pop %>% 
+    filter(Sex_label == sex, Age_label == age_group) %>% 
+    mutate(change.p = 1+(pop-lag (pop))/lag (pop)) # create a population change variable
+  
+  pop.temp <- pop.temp %>%  # interpolate data for 2020
+    add_row (year = 2020, pop = last(pop.temp$pop)*mean(tail(pop.temp$change.p,2))) %>% # add data for 2020
+    dplyr::select (year, pop) 
+}
+
+# Apply the function to get total population
+pop<-pop.data.prep (sex='Men and women', age_group='Total population (all ages)') # all population
+
+# Population per sex
+pop.m<-pop.data.prep (sex='Men', age_group='Total population (all ages)') # men only
+pop.w<-pop.data.prep (sex='Women', age_group='Total population (all ages)') # women only
+
+# Population per age group
+pop.0to20 <- pop.data.prep (sex='Men and women', age_group='0 to 20 years') 
+pop.20to65 <- pop.data.prep (sex='Men and women', age_group='20 to 65 years') 
+pop.65plus <- pop.data.prep (sex='Men and women', age_group='65 years or older') 
+pop.65to70 <- pop.data.prep (sex='Men and women', age_group='65 to 70 years')
+pop.70to75 <- pop.data.prep (sex='Men and women', age_group='70 to 75 years') 
+pop.75to80 <- pop.data.prep (sex='Men and women', age_group='75 to 80 years') 
+
+# We gotta do some work to match the age categories from the mortality dataset
+pop.0to65 <- left_join(pop.0to20, pop.20to65, by = 'year') %>% 
+  mutate (pop = pop.x + pop.y) %>% 
+  dplyr::select (year, pop) 
+
+pop.65to80 <- left_join(pop.65to70, pop.70to75, by = 'year') %>% 
+  left_join(., pop.75to80, by = 'year') %>% 
+  mutate (pop.65=pop.x+pop.y+pop) %>% 
+  dplyr::select (year, pop.65)
+
+pop.80plus <- left_join(pop.65plus, pop.65to80, by = 'year') %>% 
+  mutate (pop.80 = pop - pop.65) %>% 
+  dplyr::select (year, pop.80)
+
+# We can also do the same per sex and age group simultaneously. Maybe later ...
+```
+
+### Monthly population data
+Ideally, we would have population data on a weekly basis to match the mortality data, but this is not available from CBS. Monthly data, however, *is* available, although not disaggregated by sex and age group. Still, let's get it in case we want to use it later.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+# Get population per month
+month.pop <- cbs_get_data('83474ENG') %>%
+  cbs_add_label_columns() %>%
+  mutate (pop.m = PopulationAtStartOfSelectedPeriod_1 / 1e6, # divide by a million
+          year = as.numeric(as.character(substr(Periods_label, 1, 4))),
+          month = as.character(substr(Periods, 7, 8)),
+          year.month = paste0(year, '.', month), # create index
+          filter_n = as.character(substr(Periods, 5,6))) %>%
+  filter (year > 1994, filter_n != 'JJ')  %>%
+  add_row (year = 2020, month = '12', year.month = '2020.12', pop.m = 17.46964) %>% 
+  dplyr::select (pop.m, year.month)
+```
+
+### Merge the mortality and population data
+Now we can merge the mortality and population datasets and calculate the number of deaths per capita (per million of population). We will also add a counter variable for the year and the shares of people between 65 and 80, older than 65, and older than 80 from the total population. 
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+d <- left_join (deaths, pop, by = 'year') %>%  # add total population
+  left_join(., pop.80plus, by='year') %>%  # add population above 80
+  left_join(., pop.65to80, by='year') %>%  # add population 65 to 80
+  left_join(., month.pop, by='year.month') %>%  # add monthly population
+  mutate (deaths.pc = deaths / pop, # calculate deaths per capita
+          share.80 = pop.80/pop*100, # calculate share of 80+
+          share.65 = pop.65/pop*100, # calculate share of 65 to 80
+          share.65plus = share.80 + share.65, # calculate share of 65+
+          counter = year-2009 # a counter variable for the year
+          )
+```
+
+# Annual mortality over time
+For the rest of the analysis we will work with the weekly data, but let's quickly visualize the annual mortality trends. Plotting the annual average weekly  mortality rate (top panel) and the total number of deaths per year (bottom panel) over the period 1995 to 2020, we notice that the trends prior to 2007 and after 2010 are quite different. This is important because if we want to include a yearly time trend in our predictions for 2020, the older trend prior to 2007 can distort the predictions. (if you are interested why the mortality rate in the Netherlands increases over the past years, have a look [here](https://twitter.com/dtoshkov/status/1253242075203731462?lang=en))
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9)}
+mean.year<-d %>% 
+  group_by(year) %>% 
+  summarize(total.deaths = sum (deaths), 
+            mean.deaths.pc=mean(deaths.pc), 
+            pop = mean(pop)
+            )
+
+par(mfrow=c(2,1), mar=c(4,2,1,1), bty='n')
+plot( x = mean.year$year, y = mean.year$mean.deaths.pc, type='l', lwd=2, col='red', ylab='', xlab='Average weekly mortality rate per million per year in the Netherlands')
+points( x = mean.year$year, y = mean.year$mean.deaths.pc, col='red', pch=21, bg='white')
+
+plot( x = mean.year$year, y = mean.year$total.deaths, type='l', lwd=2, col='darkblue', ylab='', xlab='Total mortality (number of deaths) per year in the Netherlands')
+points( x = mean.year$year, y = mean.year$total.deaths, col='darkblue', pch=21, bg='white')
+```
+
+# The evaluation approach
+Now we are ready to start modeling. In the beginning, we will build simple statistical models that will serve as benchmarks against which to compare the more complex ones. In order to evaluate the predictive performance of the models, we will adopt the following approach: First, we remove the years 2020 and 2019 from the data; then, we fit the models only on data until 2018; then, we extrapolate from these models for 2019; and, finally, we compare these extrapolations (predictions) to the actual observed data from 2019. These are called **out-of-sample predictions**, because the evaluation data is not part of the sample on which the models are estimated. By comparing the predictions from the models to data that is available but has *not* been used in estimating the parameters of the models, we can get assessments of the model performance that are both 'honest' - because we don't use the same data to build and evaluate the models - and credible - because we evaluate against real and not against simulated data. 
+
+The code below creates two susbsets of the data - one to estimate the models and another one to use for evaluation.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+w = 52 # last available week
+
+# Model data: filter data before 2010 and after 2018 out
+d.s <- d %>%  
+  filter (week > 0, week <= w) %>% 
+  filter (year > 2009, year < 2019) 
+
+# Evaluation data: collect the 2019 data in a separate dataset
+d.2019 <- d %>%  
+  filter (week > 0, week <= w) %>% 
+  filter (year == 2019) 
+```
+
+To compare the predictive performance of the models, we will use two measures: **mean absolute prediction error (MAE)** and **mean squared prediction error (MSE)**. Both measures take the average of the differences between the predicted and observed values for each week, but MAE takes the absolute values of the differences and MSE takes the squared values of the differences. MAE is useful because it provides a direct measure of the wrongly predicted deaths (either too few or too many for the particular week). MSE is useful because it is more closely related to the error that the models try to minimize within the sample. Note that the MSE penalizes more heavily bigger prediction errors, because the errors are squared.  I like MAE because it has an easily interpretable scale: number of deaths, while MSE does not. But there can be [reasons](https://stats.stackexchange.com/questions/48267/mean-absolute-error-or-root-mean-squared-error) to prefer MSE as well. 
+
+# Varieties of statistical models
+## (Too) simple: week dummies
+The first model we build is a linear regression model that features only the week, entered as a categorical variable (week dummies). This is equivalent to using the average for each week over the period 2010-2018 to predict the value for that week for 2019. As simple as this is, this is the approach that many newspapers and websites use, including [Our World in Data](https://ourworldindata.org/excess-mortality-covid) and [EFTA](https://www.efta.int/Publications/news/COVID-19-Excess-Mortality-Selected-European-Countries-521261).
+We can have two versions of the models, one with the mortality *rate* as the dependent variable (also called outcome or response variable) and one with the raw number of deaths as the dependent variable. This and all models that follow also feature the number of days in the week (remember Week 1 and 52) as a predictor.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+### Model 1a, mortality rate
+summary(m1a<-lm(deaths.pc ~ as.character(week) + n_days, data=d.s))
+```
+
+As we can see from the output, each week is treated as a separate category, and we get a separate regression coefficient for each week (the intercept is the estimate for Week 1). With all these coefficients, the output is not too pretty, so we will not print it anymore, but you can always call it with `summary()`.
+Let's check that the model is equivalent to taking the weekly averages as predictions.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+# it is essentially just the means per week
+mean(d.s$deaths.pc[d.s$week==2]) 
+m1a$coefficients['(Intercept)'] + m1a$coefficients['as.character(week)2']
+```
+
+Yes, it is. 
+
+Now we can obtain the model predictions for 2019 and calculate the prediction errors.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+# prepare new data for evaluation
+predict.m1a.2019<-predict (m1a, newdata=d.2019)
+
+# mean absolute error
+mae.m1a.2019<-round (mean(abs(predict.m1a.2019 - d.2019$deaths.pc)), 2) 
+mae.m1a.2019
+
+# mean squared error
+mse.m1a.2019<-round (mean((predict.m1a.2019 - d.2019$deaths.pc)^2), 0) 
+mse.m1a.2019
+```
+
+Let's run the same model but with the raw number of deaths as the dependent variable. 
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+### Model 1b, number of deaths
+m1b<-lm(deaths ~ as.character(week) + n_days, data=d.s)
+
+predict.m1b.2019<-predict (m1b, newdata=d.2019) # prepare new data for evaluation
+print(mae.m1b.2019<-round (mean(abs(predict.m1b.2019 - d.2019$deaths)), 2)) # mean absolute error
+print(mse.m1b.2019<-round (mean((predict.m1b.2019 - d.2019$deaths)^2), 0)) # mean squared error
+```
+
+We can see from the output that the MAE of Model 1a (mortality rate) is **`r mae.m1a.2019`**. By multiplying this by 52 weeks and `r round(d.2019$pop[1],2)` million (the total population in 2019), we get **`r round(mae.m1a.2019 * 52 * d.2019$pop[1], 0)`** wrongly predicted deaths over the year. The equivalent model with raw deaths as the dependent variable (Model 1b) has a MAE of **`r mae.m1b.2019`**  and predicted wrongly **`r round (mae.m1b.2019 * 52, 0)`** deaths. The means of the squared errors (MSE) are not directly comparable between the two models due to the different scales of the dependent variables. 
+
+## Adding a time trend
+These two models are of course too simple, but they provide a benchmark nonetheless. Next, we gonna add a simple yearly linear trend as a predictor. 
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+### Model 2a, mortality rate
+m2a<-lm(deaths.pc ~ as.character(week) + counter + n_days, data=d.s)
+predict.m2a.2019<-predict (m2a, newdata=d.2019)
+
+print(mae.m2a.2019<-round (mean(abs(predict.m2a.2019 - d.2019$deaths.pc)), 2) )
+print(mse.m2a.2019<-round (mean((predict.m2a.2019 - d.2019$deaths.pc)^2), 0) )
+
+
+### Model 2b, number of deaths
+m2b<-lm(deaths ~ as.character(week) + counter + n_days, data=d.s)
+predict.m2b.2019<-predict (m2b, newdata=d.2019)
+
+print(mae.m2b.2019<-round (mean(abs(predict.m2b.2019 - d.2019$deaths)), 2) )
+print(mse.m2b.2019<-round (mean((predict.m2b.2019 - d.2019$deaths)^2), 0))
+```
+
+These two models with the time trends perform much better. The coefficients for the linear trends are positive in both models (`r round(m2a$coefficients['counter'], 2)` and `r round(m2b$coefficients['counter'], 2)`), meaning that the mortality rate and the number of deaths increase over time. The MAE of the mortality rate model drops to **`r mae.m2a.2019`**, which makes for **`r round(mae.m2a.2019 * 52 * d.2019$pop[1], 0)`** wrongly predicted deaths over the course of the year. The model of raw deaths performs even better with **`r round(mae.m2b.2019 * 52,0)`** wrongly predicted deaths. The MSE of both models also improve relative to the models without the yearly time trends.
+
+## Population and sub-population shares
+The linear time trend is an improvement, but it might be better to model directly the factors that lead to increasing mortality over time. These factors relate most obviously to the growing population and the swelling share of old people in the total population. We can replace the linear time trend with a measure of the population and see what happens.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+### Model 3a, mortality rate
+m3a<-lm(deaths.pc ~ as.character(week) + pop + n_days, data=d.s)
+predict.m3a.2019<-predict (m3a, newdata=d.2019)
+print(mae.m3a.2019<-round (mean(abs(predict.m3a.2019 - d.2019$deaths.pc)), 2))
+print(mse.m3a.2019<-round (mean((predict.m3a.2019 - d.2019$deaths.pc)^2), 0))
+
+### Model 3b, number of deaths
+m3b<-lm(deaths ~ as.character(week) + pop + n_days, data=d.s)
+predict.m3b.2019<-predict (m3b, newdata=d.2019)
+print(mae.m3b.2019<-round(mean(abs(predict.m3b.2019 - d.2019$deaths)), 2))
+print(mse.m3b.2019<-round(mean((predict.m3b.2019 - d.2019$deaths)^2), 0))
+```
+
+Surprisingly, both models perform worse than the ones with a simple linear time trend. The coefficients for the total population in the country are positive and significant, but they do not provide larger predictive leverage than linear time trends. 
+
+Perhaps we will do better by using the share of old people in the population instead of the total population. These variables are all very strongly correlated with each other (and with the linearly increasing time trend), but still one might be systematically more useful for the predictions than the others.  
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+### 65to80 share
+m4a<-lm(deaths.pc ~ as.character(week) + share.65 + n_days, data=d.s)
+predict.m4a.2019<-predict (m4a, newdata=d.2019)
+print(mae.m4a.2019<-round (mean(abs(predict.m4a.2019 - d.2019$deaths.pc)), 2))
+print(mse.m4a.2019<-round (mean((predict.m4a.2019 - d.2019$deaths.pc)^2), 0))
+
+m4b<-lm(deaths ~ as.character(week) + share.65 + n_days, data=d.s)
+predict.m4b.2019<-predict (m4b, newdata=d.2019)
+print(mae.m4b.2019<-round(mean(abs(predict.m4b.2019 - d.2019$deaths)), 2))
+print(mse.m4b.2019<-round(mean((predict.m4b.2019 - d.2019$deaths)^2), 0))
+
+### 80+ share
+m5a<-lm(deaths.pc ~ as.character(week) + share.80 + n_days, data=d.s)
+predict.m5a.2019<-predict (m5a, newdata=d.2019)
+print(mae.m5a.2019<-round (mean(abs(predict.m5a.2019 - d.2019$deaths.pc)), 2))
+print(mse.m5a.2019<-round (mean((predict.m5a.2019 - d.2019$deaths.pc)^2), 0))
+
+m5b<-lm(deaths ~ as.character(week) + share.80 + n_days, data=d.s)
+predict.m5b.2019<-predict (m5b, newdata=d.2019)
+print(mae.m5b.2019<-round(mean(abs(predict.m5b.2019 - d.2019$deaths)), 2))
+print(mse.m5b.2019<-round(mean((predict.m5b.2019 - d.2019$deaths)^2), 0))
+
+### 65+ share
+m6a<-lm(deaths.pc ~ as.character(week) + share.65plus + n_days, data=d.s)
+predict.m6a.2019<-predict (m6a, newdata=d.2019)
+print(mae.m6a.2019<-round (mean(abs(predict.m6a.2019 - d.2019$deaths.pc)), 2))
+print(mse.m6a.2019<-round (mean((predict.m6a.2019 - d.2019$deaths.pc)^2), 0))
+
+m6b<-lm(deaths ~ as.character(week) + share.65plus + n_days, data=d.s)
+predict.m6b.2019<-predict (m6b, newdata=d.2019)
+print(mae.m6b.2019<-round(mean(abs(predict.m6b.2019 - d.2019$deaths)), 2))
+print(mse.m6b.2019<-round(mean((predict.m6b.2019 - d.2019$deaths)^2), 0))
+```
+
+Somewhat surprisingly, the best model is the one using the share of people between 65 and 80 years old as a predictor, followed very closely by the one using the share of 80+ people. But the differences in the predictive performance of these model variations are quite small. 
+
+We can compare the models' performance graphically. The plot below shows the observed 2019 mortality in blue and the predictions from the models with a time trend (red) and with the 65-to-80 population shares (in green). All models over-predict until about week 40 and are quite close to the observed values after. They tend to capture the *time trend* over the weeks relatively well, but the *level* is shifted up until week 40 or so. There are also a couple of observations in the summer with very high mortality due to a heat wave that are not predicted well (for now, keep track on these summer weeks to see what happens when we add weather data to the predictors).
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9) }
+par(mfrow=c(2,1), mar=c(4,2,1,1))
+plot (x = d.2019$week, y = predict.m2a.2019, ylim=c(min(c(predict.m2a.2019,d.2019$deaths.pc)), max(c(predict.m2a.2019,d.2019$deaths.pc))), 
+      type='l', lwd=2, col='red', ylab='', xlab='Mortality rate per million per week in 2019: predicted (red and green) and observed (blue)')
+lines (x = d.2019$week, y = d.2019$deaths.pc, lwd=2, col='darkblue')        
+lines (x = d.2019$week, y = predict.m4a.2019, lwd=2, col='darkgreen')        
+points (x = d.2019$week, y = predict.m2a.2019, col='red', pch=21, bg='white')        
+points (x = d.2019$week, y = d.2019$deaths.pc, col='darkblue', pch=21, bg='white')
+points (x = d.2019$week, y = predict.m4a.2019, col='darkgreen', pch=21, bg='white')
+
+plot (x = d.2019$week, y = predict.m2b.2019, ylim=c(min(c(predict.m2b.2019,d.2019$deaths)), max(c(predict.m2b.2019[1:51],d.2019$deaths[1:51]))), 
+      type='l', lwd=2, col='red', ylab='', xlab='Number of deaths per week in 2019: predicted (red and green) and observed (blue)')
+lines (x = d.2019$week, y = d.2019$deaths, lwd=2, col='darkblue')        
+lines (x = d.2019$week, y = predict.m4b.2019, lwd=2, col='darkgreen')        
+points (x = d.2019$week, y = predict.m2b.2019, col='red', pch=21, bg='white')        
+points (x = d.2019$week, y = d.2019$deaths,col='darkblue', pch=21, bg='white')   
+points (x = d.2019$week, y = predict.m4b.2019, col='darkgreen', pch=21, bg='white')        
+```
+
+One common feature to the population variables used so far is that they only change once a year, while in reality the population structure evolves more gradually over the course of time. We can check whether including the monthly population can improve the models:
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9) }
+### Monthly population
+m7a<-lm(deaths.pc ~ as.character(week) + pop.m + n_days, data=d.s)
+predict.m7a.2019<-predict (m7a, newdata=d.2019)
+print(mae.m7a.2019<-round (mean(abs(predict.m7a.2019 - d.2019$deaths.pc)), 2))
+print(mse.m7a.2019<-round (mean((predict.m7a.2019 - d.2019$deaths.pc)^2), 0))
+
+m7b<-lm(deaths ~ as.character(week) + pop.m + n_days, data=d.s)
+predict.m7b.2019<-predict (m7b, newdata=d.2019)
+print(mae.m7b.2019<-round(mean(abs(predict.m7b.2019 - d.2019$deaths)), 2))
+print(mse.m7b.2019<-round(mean((predict.m7b.2019 - d.2019$deaths)^2), 0))
+```
+
+Again, the somewhat surprising answer is 'no'. The predictions are worse. Perhaps having monthly data on the population shares of old people would work, but this is unfortunately not available.
+
+Let's summarize the results of the model comparisons so far. The table below shows the adjusted R-squared for the models, which indicates the fit of the model to the data from which it is estimated, as well as the MAE and MSE. The table also shows the total number of wrongly predicted deaths over the year to enable a comparison of the models of the mortality rate and the count of raw deaths.
+
+The best model so far (Model 4b) is the model of the count of raw deaths as a function of the week and the share of 65-to-80 years old in the population. We can already note that the models of the raw number of deaths dominate the models of mortality rate, so for the remainder of the analysis, we will focus on modeling mortality as a count of the number of deaths rather than as a rate from the total population. Clearly, the worst models are the ones that only use the weekly average, which is noteworthy given that this remains a popular method to estimated excess mortality in the media. On a sidenote, see how the measures of the model fit (the adjusted R-squared) cannot be used to distinguish the out-of-sample *predictive* performance of the models.
+
+We should also note that in absolute terms the best models are not doing too bad: the total number of deaths recorded in 2019 was `r sum(d.2019$deaths)`, so the wrongly predicted ones from the best model so far are **`r round (mae.m4b.2019*52/sum(d.2019$deaths),4)*100`%** from the total. The difference between the total number of deaths predicted over the course of 2019 based on Model 4b - `r as.integer(sum(predict.m4b.2019))` - and the observed total for 2019 is only **`r round( sum(predict.m4b.2019) - sum(d.2019$deaths), 0)` deaths**!
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, echo=FALSE}
+library(knitr)
+out1 <- data.frame (cbind(c('Model 1a','Model 2a','Model 3a','Model 4a','Model 5a','Model 6a', 'Model 7a',
+                            'Model 1b','Model 2b','Model 3b','Model 4b','Model 5b','Model 6b', 'Model 7b'),
+                          c('rate: week dummies','rate: week dummies, trend','rate: week dummies, pop',
+                            'rate: week dummies, 65to80','rate: week dummies, 80+','rate: week dummies, 65+','rate: week dummies, monthly pop',
+                            'count: week dummies','count: week dummies, trend','count: week dummies, pop',
+                            'count: week dummies, 65to80','count: week dummies, 80+','count: week dummies, 65+','count: week dummies, monthly pop'),
+                          c(round(summary(m1a)[[9]], 2),round(summary(m2a)[[9]], 2),round(summary(m3a)[[9]], 2),
+                            round(summary(m4a)[[9]], 2),round(summary(m5a)[[9]], 2),round(summary(m6a)[[9]], 2),round(summary(m7a)[[9]], 2),
+                            round(summary(m1b)[[9]], 2),round(summary(m2b)[[9]], 2),round(summary(m3b)[[9]], 2),
+                            round(summary(m4b)[[9]], 2),round(summary(m5b)[[9]], 2),round(summary(m6b)[[9]], 2),round(summary(m7b)[[9]], 2)),
+                          c(mae.m1a.2019,mae.m2a.2019,mae.m3a.2019,mae.m4a.2019,mae.m5a.2019,mae.m6a.2019,mae.m7a.2019,
+                            mae.m1b.2019,mae.m2b.2019,mae.m3b.2019,mae.m4b.2019,mae.m5b.2019,mae.m6b.2019, mae.m7b.2019),
+                          c(round(mae.m1a.2019*52*d.2019$pop[1],0), round(mae.m2a.2019*52*d.2019$pop[1],0),
+                            round(mae.m3a.2019*52*d.2019$pop[1],0), round(mae.m4a.2019*52*d.2019$pop[1],0),
+                            round(mae.m5a.2019*52*d.2019$pop[1],0), round(mae.m6a.2019*52*d.2019$pop[1],0),round(mae.m7a.2019*52*d.2019$pop[1],0),
+                            round(mae.m1b.2019*52,0),round(mae.m2b.2019*52,0),round(mae.m3b.2019*52,0),
+                            round(mae.m4b.2019*52,0),round(mae.m5b.2019*52,0),round(mae.m6b.2019*52,0),round(mae.m7b.2019*52,0)),
+                          c(mse.m1a.2019,mse.m2a.2019,mse.m3a.2019,mse.m4a.2019,mse.m5a.2019,mse.m6a.2019,mse.m7a.2019,
+                            mse.m1b.2019,mse.m2b.2019,mse.m3b.2019,mse.m4b.2019,mse.m5b.2019,mse.m6b.2019,mse.m7b.2019)))
+colnames(out1) <- c('Model','Features','R-squared','Mean absolute error','Wrongly predicted deaths', 'Mean squared error')
+kable(out1, caption = 'Comparing the predictive performance of the models against 2019 data', align=c('l','l', rep('r',4)))
+```
+
+## Time lags
+One way in which we can significantly improve the fit of the models is to include lagged values of the mortality rate and the number of deaths. Indeed, when we look at the autocorrelation (ACF) and partial autocorrelation (PACF) functions, there is very strong evidence for first and second order autocorrelation. This means that the values of mortality in the current week are strongly and positively correlated with the the values of mortality one, and to a lesser extent, two weeks ahead.   
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9)}
+par(mfrow=c(1,2))
+acf(d.s$deaths, main='Number of deaths, 2010-2018', col='darkblue')
+pacf(d.s$deaths, main='Number of deaths, 2010-2018', col='darkblue')
+```
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+m4b.lags<-lm(deaths ~ as.character(week) + share.65 + n_days + lag(deaths) + lag(deaths,2), data=d.s)
+```
+
+Indeed, when we add the first and second lags of the number of deaths to our model (Model 4b.lags), the coefficients of both lags are positive and highly significant (**`r round(m4b.lags$coefficients['lag(deaths)'], 2)`** and **`r round(m4b.lags$coefficients['lag(deaths, 2)'], 2)`** respectively) and the fit of the model increases significantly as well (adjusted r-squared of **`r round(summary(m4b.lags)[[9]], 2)`**, compared to **`r round(summary(m4b)[[9]], 2)`** of the same model without the lags).
+
+So shall we keep the lags in our model? Not so fast. Having a model with lags will significantly improve our ability to forecast the number of deaths one and two weeks ahead. But this is not our task. What we need to do is to predict the expected pattern for the year ahead without using information from that year that is related to the phenomenon we study. If an external shock, such as COVID-19, starts increasing the number of deaths in week 20, we **do not want** our predictions to be conditional on the information from that week, because that will partially remove the effect of COVID-19 for weeks 21 and 22, even if it would improve our forecast about how many deaths we will observe in weeks 21 and 22. In fact, it is even not trivial to obtain predictions for 2019 from the model above, given the presence of the lags. Note that using *contemporaneous external (exogenous) data* for the year we are predicting, such as weather, is fine.
+
+## Sine waves instead of dummies
+So far, we treated each week as a categorical variable: in other words, the models included a dummy for each week. In reality, we would expect that there are only gradual changes between mortality in consecutive weeks. The week dummies can result in over-fitting without improving the out-of-sample predictions. So we can try to replace the week dummies with a flexible time trend, for example a sine curve that goes smoothly down from winter until late summer and then up again. 
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+m8b<-lm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + share.65 + n_days, data=d.s)
+predict.m8b.2019<-predict (m8b, newdata=d.2019)
+print(mae.m8b.2019<-round(mean(abs(predict.m8b.2019 - d.2019$deaths)), 2))
+print(mse.m8b.2019<-round(mean((predict.m8b.2019 - d.2019$deaths)^2), 0))
+
+```
+
+The predictive performance of this model is even better than the current benchmark (Model 4b). Given that it is also based on a more principled approach than the week dummies, it is worth keeping it. The figure below shows the predictions from the sine curve model (in red) versus the observed data for 2019 (in blue) and the predictions from the model with the week dummies (in green).
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9)}
+par(mfrow=c(1,1), mar=c(4,2,1,1))
+plot (x = d.2019$week, y = predict.m8b.2019, ylim=c(min(c(predict.m8b.2019,d.2019$deaths, predict.m4b.2019)), max(c(predict.m8b.2019,d.2019$deaths, predict.m4b.2019))), 
+      type='l', lwd=2, col='red', ylab='', xlab='Number of deaths per week in 2019: predicted (red and green) and observed (blue)')
+lines (x = d.2019$week, y = d.2019$deaths, lwd=2, col='darkblue')        
+lines (x = d.2019$week, y = predict.m4b.2019, lwd=2, col='darkgreen')        
+points (x = d.2019$week, y = predict.m8b.2019, pch=21, col='red', bg='white')        
+points (x = d.2019$week, y = d.2019$deaths, pch=21, col='darkblue', bg='white')        
+points (x = d.2019$week, y = predict.m4b.2019, pch=21, col='darkgreen', bg='white')   
+```
+
+## Non-linear models
+All models so far were linear, but both the mortality rate and the number of deaths per week are overdispersed with higher frequencies of relatively large values than expected under a normal distribution, as we can see from the histograms below:
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9)}
+par(mfrow=c(1,2))
+hist (d.s$deaths.pc, main='Mortality rate per week', col='darkgrey', ylab='', xlab='')
+hist (d.s$deaths, main='Number of deaths per week', col='darkgrey', ylab='', xlab='')
+```
+
+In response, we can consider generalized linear models which are more appropriate for dependent variables that are not normally distributed. In particular, we fit a negative binomial model with the `MASS` package, which can handle overdispersion.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+library(MASS)
+m8c<-glm.nb(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + share.65 + n_days, data=d.s)
+summary(m8b)
+predict.m8c.2019<-predict (m5b, type='response', newdata=d.2019)
+print(mae.m8c.2019<-round(mean(abs(predict.m8c.2019 - d.2019$deaths)), 2))
+print(mse.m8c.2019<-round(mean((predict.m8c.2019 - d.2019$deaths)^2), 0))
+```
+
+The predictive performance of the model against the observed 2019 data is pretty good, but no better to our benchmark so far. There still might be an advantage in sticking to the negative binomial model, because it is in principle more appropriate for handling overdispersed count data than a linear model. The disadvantage, however, is that it is more difficult to generate uncertainty estimates about the predictions from the negative binomial model (see below).
+
+## Robust regression
+Some of the weeks in the 2010-2018 period have registered an abnormal amount of deaths due to flu epidemics, heath waves or something else, and these extreme observations can have undue influence on the models we build and predictions we get from them. Running the regression diagnostics on Model 8b, we can see that three outlying observations in particular (425, 426, 427) have very large influence on the model. 
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9)}
+par(mfrow=c(2,2))
+plot(m8b)
+```
+
+We can remove these three observations, but a more principled approach is to use **robust regression**. Robust regression weights the observations differently based on how 'unexpected' they are: suspected outliers are not entirely excluded from the data, but contribute less to the model estimates. In `R` the `MASS` package includes functions for estimating robust regressions. Note that robust regression is different than using *robust standard errors*.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+m8d<-rlm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + share.65 + n_days, data=d.s, psi = psi.huber)
+predict.m8d.2019<-predict (m8d, newdata=d.2019, type='response')
+print(mae.m8d.2019<-round(mean(abs(predict.m8d.2019 - d.2019$deaths)), 2)) 
+print(mse.m8d.2019<-round(mean((predict.m8d.2019 - d.2019$deaths)^2),0))
+```
+
+The model above has the best predictive performance so far with a MAE of **`r mae.m8d.2019`**, which beats our benchmark so far. The figure below compares the predictions from the robust model (in red) to the ones of the non-robust equivalent Model 8b (in green). 
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9)}
+par(mfrow=c(1,1), mar=c(4,2,1,1))
+plot (x = d.2019$week, y = predict.m8d.2019, ylim=c(min(c(predict.m8d.2019,d.2019$deaths,predict.m8b.2019)), max(c(predict.m8b.2019,d.2019$deaths,predict.m8d.2019))), 
+      type='l', lwd=2, col='red', ylab='', xlab='Mortality rate in 2019: predicted (red and green) and observed (blue)')
+lines (x = d.2019$week, y = d.2019$deaths, lwd=2, col='darkblue')        
+lines (x = d.2019$week, y = predict.m8b.2019, lwd=2, col='darkgreen')        
+points (x = d.2019$week, y = predict.m8d.2019, pch=21, col='red', bg='white')        
+points (x = d.2019$week, y = d.2019$deaths, pch=21, col='darkblue', bg='white')  
+points (x = d.2019$week, y = predict.m8b.2019, pch=21, col='darkgreen', bg='white')  
+```
+
+There is a robust version of the negative binomial model as well, but the implementation in `R` is not very user-friendly if one wants to make predictions from the model or get uncertainty estimates in the form of prediction intervals (see [here](https://github.com/williamaeberhard/glmrob.nb) for details).
+
+## Adding temperature 
+Some of the outliers in the data might be due to extreme weather - weeks with very low or very high temperature. We can add temperature data to the model to check whether it will make any difference. The `rnoaa` package provides access to open historical weather data from around the world, including many stations in the Netherlands. We will use this package to extract a time series of the minimum and maximum daily temperatures from one Dutch weather station, and we will aggregate the daily values into weekly ones to match the mortality and population data. (You will have to download a free key to access the weather data).
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+### Getting weather data
+library(rnoaa)
+# set key
+```
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, echo=FALSE}
+options(noaakey = "hKkStiPTZiDOsqQfyMCLoFgloksNDMCw")
+```
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+# make a function to download per year
+get_weather <- function (year, datatype){
+  temp <-ncdc(datasetid='GHCND', stationid='GHCND:NLM00006235', datatypeid=datatype,
+              startdate = paste0(year,'-01-01'), enddate = paste0(year,'-12-31'),limit=732)}
+
+# apply the function for all years between 1995 and 2020
+for (i in 2008:2020){
+  assign(paste0('nlw', i), get_weather (year = i, datatype = c('TMIN', 'TMAX')))
+}
+
+# merge all yearly datasets
+nlw <- ncdc_combine(nlw2008, nlw2009, nlw2010, nlw2011, nlw2012, nlw2013, nlw2014, nlw2015, nlw2016, nlw2017, nlw2018, nlw2019, nlw2020)
+
+# make new variables
+nlw <- nlw$data %>% 
+  dplyr::select (date, value, datatype) %>%
+  mutate (date = substr(date, 1, 10),
+          temp = value/10) %>%
+  dplyr::select (-value) %>%
+  spread(datatype, temp)
+
+# aggregate at week level
+nlw.w <- read.zoo (nlw)
+nlw.w <- apply.weekly(nlw.w, mean, na.rm=T)
+nlw.w$week<-as.numeric(as.character(strftime(nlw.w,format = "%V")))
+nlw.w$year<-as.numeric(as.character(strftime(nlw.w,format = "%Y")))
+
+# transform variables 
+nlw.w  = data.frame(nlw.w) %>% 
+  mutate (temp.max = round(as.numeric(as.character(TMAX)), 2),
+          temp.min = round(as.numeric(as.character(TMIN)), 2),
+          id = paste0(year, '.', week),
+          id = case_when(id == '2010.53' ~ '2010.52', id == '2016.53' ~ '2016.52', TRUE ~ id) # recode weeks 53 to 52
+          ) %>% 
+  dplyr::select (id, temp.max, temp.min) 
+
+# create variables to use in the models
+nlw.w$t.min<-ifelse(nlw.w$temp.min>0, 0, 0-nlw.w$temp.min)
+nlw.w$t.max<-ifelse(nlw.w$temp.max<20, 0, nlw.w$temp.max-20)
+
+nlw.w<-nlw.w[-c(209,470),] # two observations need to be removed due to the way weeks are constructed
+```
+
+Now we can attach the newly-acquired weather data to the rest of the data.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+d$id <- paste0(d$year, '.', d$week)
+d <- left_join(d, nlw.w, by='id')
+
+# Now is a good moment to save the data
+write.csv(d, file='nl_mortality_data.csv')
+
+# Filter again data before 2010 and after 2018 out
+d.s <- d %>%  
+  filter (week > 0, week <= w) %>% 
+  filter (year > 2009, year < 2019) 
+
+# Collect the 2019 data in a separate dataset
+d.2019 <- d %>%  
+  filter (week > 0, week <= w) %>% 
+  filter (year == 2019) 
+```
+
+We have to decide how to enter temperature in the models. We would expect that temperature in a normal range does not influence mortality, but beyond and above some thresholds it does. To decide where are these thresholds, we can plot the residuals from one of our models (Model 8b) against the weekly minimum and maximum temperature and check at which points the residuals start to increase.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9)}
+par(mfrow=c(2,1))
+lw1 <- loess(m8b$residuals ~ d.s$temp.min)
+plot( d.s$temp.min, m8b$residuals, xlab='Weekly average of daily minimum temperature', ylab='residuals')
+j <- order(d.s$temp.min)
+lines(d.s$temp.min[j],lw1$fitted[j],col="red",lwd=3)
+abline(h=0, col='darkblue')
+
+lw2 <- loess(m8b$residuals ~ d.s$temp.max)
+plot( d.s$temp.max, m8b$residuals, xlab='Weekly average of daily maximum temperature', ylab='residuals')
+j <- order(d.s$temp.max)
+lines(d.s$temp.max[j],lw2$fitted[j],col="red",lwd=3)
+abline(h=0, col='darkblue')
+```
+
+As we can see, the residuals start to increase once the minimum temperature drops below 0 degrees (Celsius) and once the maximum temperature goes above 20 degrees. That's why we recoded the minimum and maximum temperatures as 0s in the range 0 to 20 degrees, and then we inverted the minimum temperatures so that higher values mean greater distance from the normal range. Now we are ready to add temperature to the models.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+m9d<-rlm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + share.65 + n_days + t.min + t.max, data=d.s, psi = psi.huber)
+summary(m9d)
+predict.m9d.2019<-predict (m9d, newdata=d.2019)
+print(mae.m9d.2019<-round(mean(abs(predict.m9d.2019 - d.2019$deaths)), 2) )
+print(mse.m9d.2019<-round(mean((predict.m9d.2019 - d.2019$deaths)^2), 0) )
+```
+
+The addition improves the models quite a bit. Both the minimum and maximum temperatures have big and significant effects. The MAE of the predictions drops to **`r mae.m9d.2019`**, which makes for only **`r as.integer(round(mae.m9d.2019 * 52, 0))`** mis-predicted deaths for the whole year 2019. The negative binomial alternative is only slightly worse:
+
+```{r eval=TRUE, message=FALSE, warning=FALSE, collapse=TRUE}
+m9c<-glm.nb(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + share.65 + n_days + t.min + t.max, data=d.s)
+predict.m9c.2019<-predict (m9c, type='response', newdata=d.2019)
+print(mae.m9c.2019<-round(mean(abs(predict.m9c.2019 - d.2019$deaths)), 2))
+print(mse.m9c.2019<-round(mean((predict.m9c.2019 - d.2019$deaths)^2), 0))
+```
+
+To sum up, the best models so far: (1) model the raw number of deaths rather than mortality rate, (2) include a sine wave to model variation between weeks over the course of the year rather than having week dummies, (3) include predictors for temperature lower than 0 and higher than 20 and a variable tracking the number of days in a week, (4) include the share of old people (between 65 and 80 works best) rather than a linear yearly trend or the total number of population, even if measured on a monthly basis, (5) are based either on robust linear or negative binomial specification. The best model has rather impressive performance: the total number of mis-predicted deaths for 2019 is **`r as.integer(round(mae.m9c.2019*52,0))`**. This makes for **`r as.integer(round(round(mae.m9c.2019*52,0)/sum(d.2019$deaths)*100,2))`%** of all recorded deaths in 2019. Moreover, the best model would predict a total of **`r as.integer(round(sum(predict.m9c.2019),0))`** deaths, which is very, very close to the actual **`r as.integer(round(sum(d.2019$deaths),0))`** deaths that were recorded in 2019 (the difference is less than 1%).
+
+
+## Using different years as prediction benchmarks 
+Of course, there is nothing special about evaluating our out-of-sample predictions on the data from 2019, so we can repeat the steps above but use the data from 2018, 2017, 2016 and 2015 as the prediction evaluation benchmarks. The code below specifies a list of models, re-estimates the models on different subsets of the data, compares the predictive performance of these models against different benchmark years, and summarizes the results (MAE in particular) in a table.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+m1b<-lm(deaths ~ as.character(week) + n_days, data=d.s)
+m2b<-lm(deaths ~ as.character(week) + counter + n_days, data=d.s)
+m3b<-lm(deaths ~ as.character(week) + t.min + t.max + counter + n_days, data=d.s)
+
+m3c<-glm.nb(deaths ~ as.character(week) + t.min + t.max + counter + n_days, data=d.s)
+
+m2d<-rlm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + t.min + t.max + n_days + counter, data=d.s, psi = psi.huber)
+m3d<-rlm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + t.min + t.max + n_days + pop, data=d.s, psi = psi.huber)
+m4d<-rlm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + t.min + t.max + n_days + share.65, data=d.s, psi = psi.huber)
+m5d<-rlm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + t.min + t.max + n_days + share.80, data=d.s, psi = psi.huber)
+m6d<-rlm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + t.min + t.max + n_days + share.65plus, data=d.s, psi = psi.huber)
+m7d<-rlm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + t.min + t.max + n_days + pop.m, data=d.s, psi = psi.huber)
+
+m4c<-glm.nb(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + t.min + t.max + n_days + share.65, data=d.s)
+
+
+models <- c('m1b', 'm2b', 'm3b', 'm3c', 'm2d', 'm3d', 'm7d', 'm5d', 'm6d', 'm4d','m4c')
+out2 <- data.frame (matrix(NA, nrow = length(models), ncol = 2 + 1*5))
+colnames(out2) <- c('Model','Features', paste0('MAE.', 2015:2019))
+out2$Model <- models
+out2$Features <- c('weeks, linear', 'trend, weeks, linear', 'temp, trend, weeks, linear', 'temp, trend, weeks, negbin',
+                   'temp, trend,  sine, robust', 'temp, pop,  sine, robust','temp, month.pop,  sine, robust', 
+                   'temp, share.80+,  sine, robust', 'temp, share.65+,  sine, robust', 
+                   'temp, share.65-80,  sine, robust', 'temp, share.65-80,  sine, negbin')
+
+for (i in 2015:2019) {
+
+  d.model <- d %>%  
+    filter (week > 0, week <= w) %>% 
+    filter (year > (i - 9), year < i) 
+  
+  d.eval <- d %>%  
+    filter (week > 0, week <= w) %>% 
+    filter (year == i) 
+  
+  for (j in 1:length(models)){
+    out2[j,2+(i-2014)]<-round(mean(abs(predict (update(get(models[j]), data=d.model), type='response', newdata=d.eval) - d.eval$deaths)), 0)
+      # assign(paste0('mae.', models[j],'.', i), round(mean(abs(predict (update(get(models[j]), data=d.model), type='response', newdata=d.eval) - d.eval$deaths)), 2)) # use this if we want to extract the predictions themselves
+    }
+  }
+
+out2$MAE.MEAN<-round(rowMeans(out2[,3:7]), 0)
+kable(out2, caption = 'Comparing the predictive performance of the models against 2015 to 2019 data', align=c('l',rep('r',7)))
+```
+
+
+The results are not very clear cut. First, it seems that 2019 was an 'easy' year to predict - all models have the best predictive performance on that year, followed by 2016. The prediction errors are more than twice as big in 2015 and 2017 and even more so in 2018. This does not indicate necessarily a problem with the models: it could be that 2018 was indeed exceptional in terms of mortality due to a heavy flu epidemic or other causes. It just means that 2018 was less predictable than 2016 or 2019 given our predictors and modeling approach. 
+
+Comparing the relative performance of the different models, there are no huge differences when we look at the averages over all years (last column). And in different years different model specifications come on top. Model 4C, which is a negative binomial specification that includes a sine wave, temperature extremes and the share of 65-to-80 population has the lowest average MAE overall. But it is the best model only evaluated against the data from 2016. The robust linear specification with the same predictors is third overall and the best in 2019, as we already noted before. Somewhat surprisingly, a linear model that has a simple linear trend, week dummies and temperature as predictors (Model 3b in the table above) performs on average very well, and it is the best model in 2015. The negative binomial version (Model 3c) is second overall and the best one in 2018. The one model that is clearly much worse than the rest is the linear model with week dummies only, which is the equivalent of taking the weekly averages from the previous years. Let's note again that this remains a popular approach despite its obvious shortcomings.
+
+The list of models in the table above does not exhaust all possible combinations of predictors and other modeling choices. For example, we can run the same set of models with the mortality *rate* as the dependent variable or include *simultaneously* different sub-population shares in the same model. I tried some of these and found that working with mortality rates is not better but not much worse than working with the raw number of deaths and that entering more than one population-based variable is not helpful. But you are free to adapt the code to try different variations yourself.
+
+## Using the the first weeks
+Before we conclude the overview of possible modeling approaches, let's try one more thing. What if we had data for some of the early weeks from the year for which we are trying to predict mortality? Could we use this information to improve the predictive accuracy of the model for the rest of the year? We can simulate this situation in the following way: first, we calculate the mean number of deaths in the first weeks  [2 to 10] for each year and we attach this variable to the dataset; then, we exclude all weeks 1 to 10 from the dataset; then, we estimate the models on the remaining weeks, adding this new variable capturing the mortality in the first weeks of the year; lastly, we predict from the model for 2019, using the observed mean mortality in weeks 2 to 10 of 2019 as an additional predictor. To conclude whether adding this variable helps, we would want to see an improvement in the predictive accuracy of the model compared to one without this new variable.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+# get the subsets of the data
+d.s2<-d.s %>%
+  group_by(year) %>%
+  mutate(mean10 = mean(deaths[2:10])) %>% # add the yearly mean mortality during weeks 2 to 10
+  filter(week>10) # remove the weeks used for the calculation.
+
+d.2019.2<-d.2019 %>%
+  mutate(mean10 = mean(deaths[2:10])) %>%
+  filter(week>10)
+
+# re-estimate one of our models on the new subsetted data
+m4e<-glm.nb(deaths ~ sin(2*pi*week/42) + cos(2*pi*week/42) + t.min + t.max + n_days + share.65, data=d.s2)
+
+predict.m4e.2019<-predict (m4e, newdata=d.2019.2, type='response')
+print(mae.m4e.2019<-round(mean(abs(predict.m4e.2019 - d.2019.2$deaths)), 2)) 
+
+# now add the new variable and compare
+m4f<-glm.nb(deaths ~ sin(2*pi*week/42) + cos(2*pi*week/42) + t.max + t.min + n_days + share.65 + mean10, data=d.s2)
+summary(m4f)
+predict.m4f.2019<-predict (m4f, type='response', newdata=d.2019.2)
+print(mae.m4f.2019<-round(mean(abs(predict.m4f.2019 - d.2019.2$deaths)), 2)) 
+```
+
+The coefficient for the new variable - the mean mortality observed in the first weeks of the year - is not significant and the model with this variable does not have lower MAE than the one without it. We can conclude that adding this information does not improve our predictions for the year ahead.
+
+# Uncertainty and prediction intervals
+Having reviewed a large number of models, we can settle on two contender models - one based on a robust linear regression specification and one based on a negative binomial specification, both having the raw number of deaths as the dependent variable and a sine trend, the share of 65-to-80 years old, temperature and the number of days in the week as predictors. What remains is to derive some measure of the uncertainty of our predictions. There are various sources of uncertainty relevant for the predictions, but our focus is on the uncertainty of the predictions conditional on the estimated model (thus, ignoring uncertainty about the correct model specification itself). 
+
+To measure the uncertainty of the model predictions, we can use the so-called **prediction intervals**. These should not be confused with *confidence intervals* (which provide a measure of uncertainty about the predicted value of the outcome conditional on some values of the predictors), which are in general considerably smaller.
+
+For the robust linear regression model, we can easily obtain the prediction intervals just by requesting them from the `predict()` function which we have already been using.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9)}
+m4d<-rlm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + t.min + t.max + n_days + share.65, data=d.s, psi = psi.huber)
+
+predict.m4d.2019<-predict (m4d, newdata=d.2019, se.fit=TRUE,interval="prediction", level=0.95)
+predict.m4d.2019c<-predict (m4d, newdata=d.2019, se.fit=TRUE,interval="confidence", level=0.95)
+
+predict.m4d.2019.mean <- predict.m4d.2019$fit[,1]
+predict.m4d.2019.plus <- predict.m4d.2019$fit[,3]
+predict.m4d.2019.minus <- predict.m4d.2019$fit[,2]
+predict.m4d.2019.c.plus <- predict.m4d.2019c$fit[,3]
+predict.m4d.2019.c.minus <- predict.m4d.2019c$fit[,2]
+
+par(mfrow=c(1,1), mar=c(4,2,1,1))
+plot (x = d.2019$week, y = predict.m4d.2019.mean, ylim=c(min(c(predict.m4d.2019.minus,d.2019$deaths)), max(c(predict.m4d.2019.plus,d.2019$deaths))), 
+      type='l', lwd=2, col='red', ylab='', xlab='Mortality in 2019: predicted (red) and observed (blue)')
+points (x = d.2019$week, y = predict.m4d.2019.mean, pch=21, col='red', bg='white')        
+lines (x = d.2019$week, y = d.2019$deaths, lwd=2, col='darkblue')        
+points (x = d.2019$week, y = d.2019$deaths, pch=21, col='darkblue', bg='white')        
+
+lines (x = d.2019$week, y = predict.m4d.2019.plus, lwd=1, col='red', lty=2)        
+lines (x = d.2019$week, y = predict.m4d.2019.minus, lwd=1, col='red', lty=2) 
+lines (x = d.2019$week, y = predict.m4d.2019.c.plus, lwd=1, col='darkgrey', lty=3)        
+lines (x = d.2019$week, y = predict.m4d.2019.c.minus, lwd=1, col='darkgrey', lty=3) 
+```
+
+As we can see, the prediction intervals are very large. Indeed, they appear too conservative given that none of the observed values in 2019 lie outside the intervals. The gray lines show the confidence intervals just for illustration: these are much narrower, but they are not appropriate for estimating the uncertainty of our predictions. We can check the coverage of the prediction intervals on the data from which the model has been estimated.
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9)}
+predict.m4d.2019.all<-predict (m4d, se.fit=TRUE,interval="prediction", level=0.95)
+predict.m4d.2019.all.mean <- predict.m4d.2019.all$fit[,1]
+predict.m4d.2019.all.plus <- predict.m4d.2019.all$fit[,3]
+predict.m4d.2019.all.minus <- predict.m4d.2019.all$fit[,2]
+
+par(mfrow=c(1,1), mar=c(4,2,1,1), bty='o')
+plot (x = 1:468, y = predict.m4d.2019.all.mean, ylim=c(min(c(predict.m4d.2019.all.minus,d.s$deaths)), max(c(predict.m4d.2019.all.plus,d.s$deaths))), 
+      type='l', lwd=2, col='red', ylab='', xlab='Mortality 2010-2018: predicted (red) and observed (blue)')
+lines (x = 1:468, y = d.s$deaths, lwd=0.5, col='blue')        
+points (x = 1:468, y = d.s$deaths, pch=21, col='blue', bg='white', cex=0.75)        
+lines (x = 1:468, y = predict.m4d.2019.all.plus, lwd=1, col='red', lty=2)        
+lines (x = 1:468, y = predict.m4d.2019.all.minus, lwd=1, col='red', lty=2) 
+abline(v=seq(1,468,52), col='grey', lwd=0.5)
+```
+
+In the 'training' dataset from which the model has been estimated, the prediction intervals have proper coverage with occasional values outside the 95% prediction intervals. These are mostly associated with the peaks of flu epidemics during the winter weeks of some years. Since there is nothing in our model that captures the influence of the flu epidemics (other than the seasonal cycles and the minimum temperature), the model is not very good in predicting these, and as a result the prediction intervals are quite large. Note that there are not many such mistakes of the model when it comes to predicting *too many* deaths in a week: almost all the observations outside the 95% prediction intervals are cases of underprediction.
+
+Does the negative binomial specification, which is specifically designed for overdispersion in the dependent variable, handle this better? It is only slightly more complicated to get prediction intervals from the negative binomial model.
+
+```{r eval=TRUE, message=FALSE, warning=FALSE, collapse=TRUE}
+library(ciTools)
+m4c<-glm.nb(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + t.min + t.max + n_days + share.65, data=d.s)
+predict.m4c.2019<-add_pi(fit=m4c, df=d.2019) # predictions for 2019
+predict.m4c.2019.all<-add_pi(fit=m4c, df=d.s) # in-sample predictions
+```
+
+As we can see, there are no huge differences, rather than for the misbehaved weeks 1 and 52.
+
+```{r eval=TRUE, message=FALSE, warning=FALSE, collapse=TRUE, fig.dim = c(12, 9)}
+par(mfrow=c(1,1), mar=c(4,2,1,1))
+plot (x = d.2019$week, y = predict.m4c.2019$pred, ylim=c(min(c(predict.m4c.2019$LPB0.025,d.2019$deaths)), max(c(predict.m4c.2019$UPB0.975,d.2019$deaths))), 
+      type='l', lwd=2, col='red', ylab='', xlab='Mortality in 2019: predicted (red) and observed (blue)')
+lines (x = d.2019$week, y = d.2019$deaths, lwd=2, col='darkblue')        
+points (x = d.2019$week, y = d.2019$deaths, pch=21, col='darkblue', bg='white')        
+points (x = d.2019$week, y = predict.m4c.2019$pred, pch=21, col='red', bg='white')        
+
+lines (x = d.2019$week, y = predict.m4c.2019$LPB0.025, lwd=1, col='red', lty=2)        
+lines (x = d.2019$week, y = predict.m4c.2019$UPB0.975, lwd=1, col='red', lty=2) 
+
+par(mfrow=c(1,1), mar=c(4,2,1,1))
+plot (x = 1:468, y = predict.m4c.2019.all$pred, ylim=c(min(c(predict.m4c.2019.all$LPB0.025,d.s$deaths)), max(c(predict.m4c.2019.all$UPB0.975,d.s$deaths))), 
+      type='l', lwd=2, col='red', ylab='', xlab='Mortality 2010-2018: predicted (red) and observed (blue)')
+lines (x = 1:468, y = d.s$deaths, lwd=0.5, col='darkblue')        
+points (x = 1:468, y = d.s$deaths, pch=21, col='darkblue', bg='white')        
+lines (x = 1:468, y = predict.m4c.2019.all$LPB0.025, lwd=1, col='red', lty=2)        
+lines (x = 1:468, y = predict.m4c.2019.all$UPB0.975, lwd=1, col='red', lty=2) 
+abline(v=seq(1,468,52), col='grey', lwd=1)
+```
+
+# Predicting 2020 mortality
+Finally, we are ready to unleash our models to predict the 2020 mortality data. We have selected predictors, we have identified both robust linear regression and negative binomial regression as appropriate modeling choices, and we can quantify prediction uncertainty from the models. Let's do it then!
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE}
+# Model data
+d.model <- d %>%  
+  filter (week > 0, week <= w) %>% 
+  filter (year > 2009, year < 2020) 
+
+# Evaluation data from 2020
+d.eval <- d %>%  
+  filter (week > 0, week <= w) %>% 
+  filter (year == 2020) 
+
+d.eval$n_days[52]<-0
+
+# Robust linear regression
+m4d<-rlm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + share.65 + t.min + t.max + n_days, data=d.model, psi = psi.huber)
+summary(m4d)
+predict.m4d.2020<-predict (m4d, newdata=d.eval)
+print(mae.m4d.2020<-round(mean(abs(predict.m4d.2020 - d.eval$deaths)), 2)) 
+print(mse.m4d.2020<-round(mean((predict.m4d.2020 - d.eval$deaths)^2), 0)) 
+
+# Negative binomial regression
+m4c<-glm.nb(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + share.65 + t.min + t.max + n_days, data=d.model)
+predict.m4c.2020<-predict (m4c, type='response', newdata=d.eval)
+print(mae.m4c.2020<-round(mean(abs(predict.m4c.2020 - d.eval$deaths)), 2)) 
+print(mse.m4c.2020<-round(mean((predict.m4c.2020 - d.eval$deaths)^2), 0)) 
+```
+
+The MAE of the predictions is `r round(mae.m4d.2020,0)` which implies `r as.integer(round(mae.m4d.2020*52*d.eval$pop[1],0))` 'mispredicted' deaths, and the MSE is `r as.integer(round(mse.m4d.2020,0))`. Both of these measures are way outside the range of what we got when we evaluated our models against any year between 2015 and 2019. Our predictions are two times worse than the predictions for 2018, which were the worst ones so far. This means that mortality during 2020 was very, very unusual and unpredictable based on models that worked very well for predicting mortality for any year between 2015 and 2019.
+
+Now let's add prediction intervals and plot. The blue line and dots show the observed mortality during 2020 (as currently measured by the CBS). The red lines show the predictions from the robust linear regression model together with the 95% prediction intervals, and the green lines show the same for the negative binomial model. There are negligible differences between the two model versions, although the prediction intervals for the negative binomial model are slightly larger. Note how many observations are outside of the 95% prediction intervals, and remember how none of the observed values for 2019 were even close to the boundaries of the prediction intervals. 
+
+```{r eval=TRUE, collapse=TRUE, message = FALSE, warning = FALSE, fig.dim = c(12, 9)}
+predict.m4d.2020.2<-predict (m4d, newdata=d.eval, se.fit=TRUE, interval="prediction", level=0.95)
+predict.m4d.2020.mean <- predict.m4d.2020.2$fit[,1]
+predict.m4d.2020.plus <- predict.m4d.2020.2$fit[,3]
+predict.m4d.2020.minus <- predict.m4d.2020.2$fit[,2]
+
+predict.m4c.2020.2<-add_pi(fit=m4c, df=d.eval) # predictions for 2020
+
+par(mfrow=c(1,1), mar=c(4,2,1,1))
+plot (x = d.eval$week, y = predict.m4d.2020.mean, ylim=c(min(c(predict.m4d.2020.minus,d.eval$deaths)), max(c(predict.m4d.2020.plus,d.eval$deaths))), 
+      type='l', lwd=2, col='red', ylab='', xlab='Mortality in 2020: predicted (red and green) and observed (blue)')
+lines (x = d.eval$week, y = d.eval$deaths, lwd=2, col='darkblue')        
+points (x = d.eval$week, y = d.eval$deaths, pch=16, col='darkblue')        
+
+lines (x = d.eval$week, y = predict.m4c.2020.2$pred, lwd=2, col='darkgreen')        
+lines (x = d.eval$week, y = predict.m4c.2020.2$LPB0.025, lwd=1, col='darkgreen', lty=2)        
+lines (x = d.eval$week, y = predict.m4c.2020.2$UPB0.975, lwd=1, col='darkgreen', lty=2)        
+lines (x = d.eval$week, y = predict.m4d.2020.plus, lwd=1, col='red', lty=2)        
+lines (x = d.eval$week, y = predict.m4d.2020.minus, lwd=1, col='red', lty=2) 
+```
+
+To be precise, according to the best models we have, **excess mortality** in 2020 has been `r as.integer(round(sum(d.eval$deaths) - sum(predict.m4d.2020), 0))` deaths. This amounts to **`r round(((round(sum(d.eval$deaths) - sum(predict.m4d.2020), 0))/sum(predict.m4d.2020))*100, 2)`%** from all predicted deaths during the year. Should all excess mortality be attributed to COVID-19? There have been no wars or natural disasters, there is no evidence for a massive flu epidemic during the year, and the mortality due to the summer heatwave seems to be predicted reasonably well by the model, so it is already taken into account. This leaves COVID-19 as the force behind the excess mortality.   
+
+Coming back to the original goal of this modeling exercise, we can say that our best estimate for the impact of COVID-19 on mortality in the Netherlands in 2020 is **an excess of `r as.integer(round(sum(d.eval$deaths) - sum(predict.m4d.2020), 0))` deaths**.
+
+# Summary and modeling recommendations
+In the course of the evaluation exercise we found out that some modeling decisions made considerable difference to the predictive performance of the models, while others did not, or did so only occasionally. What recommendations about modeling mortality data can we make on the basis of our evaluation exercise?
+
+-  Type of model: while negative binomial specifications that are in principle appropriate for overdispersed count data worked best, robust linear regression or even simple linear regression did not do much worse. So the type of model is not very consequential.
+- Mortality rate or raw number of deaths: the models on the raw number of deaths worked altogether better, although when the models were well specified, working with mortality rates instead was not much worse. Working with raw number of deaths makes it easier to present the absolute number of excess deaths, while working with mortality rate makes it easier to make comparisons between countries and over time. 
+- Yearly trends: the variation from year to year needs to be modeled, one way or another. The simplest approach is to include a (linear) time trend (after inspecting visually the yearly trends to see the overall pattern). This did actually better than including the total population numbers instead of the linear time trend, even when population was measured on a monthly basis. But, at least in the Dutch case, including the share of old people - and in particular the share of people 65-to-80 years olds - as a predictor led to the best predictive performance of the models. Overall, when population data is not available, some form of yearly trend should be included, but, ideally, the most appropriate subpopulation share should be included instead.
+- Week dummies or a sine wave: modeling variation in mortality throughout the year with a flexible trend, such as a sine wave, seems the better approach based on principle, and it often has better predictive performance than including week dummies. But sometimes the week dummies did better, and they are easier to include in the models. On balance, a time trend - in the form of a sine wave or something else - is still to be preferred, but including week dummies instead does not hurt the predictions much.
+- Temperature: adding temperature data improved consistently and considerably the predictions. There might be even better and more efficient ways to enter the temperature data in the models than taking the 'below 0' weekly average of the daily minimums and the 'above 20' weekly average of the daily maximums done here. But one way or another temperature data should feature in the models. Given that there is easily accessibly public historical weather data, there is no reason not to include temperature.
+- First and last week of the year: it is annoying to deal with the first and last weeks of the year because they can have a different number of days in the week than seven, but ignoring the issue is even more annoying. My solution has been to include a new variable tracking the number of days in all weeks.
+- Lags: don't include lags of the dependent variable, even if they improve the predictive performance of the models, because this will take away the effect of external shocks.
+
+Let's note again that taking only the weekly averages from the past years to predict mortality in 2020 and identify excess mortality proved to be the worst method in our evaluation exercise. Having only a yearly trend is also inadequate. Remarkably, even the state of the art models and estimates provided by EUROMOMO seem to be based on a model that does not include population numbers or sub-population shares, which we saw provide considerable predictive leverage (see for example [here](https://www.euromomo.eu/how-it-works/methods/) or the [model on page 48 here](https://www.euromomo.eu/uploads/pdf/wp6_report.pdf)). 
+
+It is interesting and important to discuss further how the estimates of excess mortality provided here compare to other estimates and how it compares to the official death toll of the pandemic measured from individual death certificates. We can also explore how excess mortality is distributed across different sex and age groups. And we can make much better graphs visualizing the impact of COVID-19 on mortality in 2020. But all this requires a separate post. 
+
+For now, we're done!  
+
+# The end
+
