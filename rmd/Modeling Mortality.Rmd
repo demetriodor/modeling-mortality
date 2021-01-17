@@ -71,7 +71,7 @@ It is already popular to visualize mortality in order to gauge the impact of the
 
 In this document, I show step-by-step how we can estimate the impact of COVID-19 on mortality. I build a large number of statistical models that we can use to predict expected mortality in 2020. The complexity of the models ranges from the simplest, based only on weekly averages from past years, to what is currently the state of the art. 
 
-But this is not all. What I also do is review the predictive performance of all of these models, so that we know which ones work best. I run the models on publicly available data from the Netherlands, I use only the open software `R`, and I share the code, so anyone can check, replicate and extend the exercise. 
+But this is not all. What I also do is review the predictive performance of all of these models, so that we know which ones work best. I run the models on publicly available data from the Netherlands, I use only the open software `R`, and I share the code [here](https://github.com/demetriodor/modeling-mortality), so anyone can check, replicate and extend the exercise. 
 
 I hope this document  will provide some transparency about how expected mortality is and can be estimated from data and how it can be used to identify the effect of the pandemic. Feel free to try different estimation strategies, adapt the code to data from different countries, or use different measures to compare the performance of the models.
 
@@ -134,7 +134,7 @@ deaths.w.65to80 <- data.prep(sex = 4000, age_group = 53950) # women, 65 to 80 de
 deaths.w.0to65 <- data.prep(sex = 4000, age_group = 41700) # women, 0 to 65 deaths
 ```
 
-As you can see, getting the mortality data per week for the Netherlands is quite straightforward. But if you don't want to bother with getting the data yourself, you can access the complete dataset used in the analysis [here](http://github.com). 
+As you can see, getting the mortality data per week for the Netherlands is quite straightforward. But if you don't want to bother with getting the data yourself, you can access the complete dataset used in the analysis [here](https://github.com/demetriodor/modeling-mortality). 
 
 There is only one complication that creates a lot of nuisance: some weeks start with Week 0 rather than Week 1, few years end with Week 53 rather than Week 52, and some years have incomplete Week 1 and Week 52. We can ignore that (as almost everyone else does), but we can also tackle the complication head on. To do so, we recode weeks 0 and 53 to 1 and 52 respectively, then we aggregate the data so that these weeks feature only once in the resulting dataset, and - most importantly - we create a variable that tracks the number of days in the week, which will be the same for all weeks between 2 and 51, but will differ for weeks 1 and 52. In this way we keep the abnormal starting and ending weeks of the year in the data, but we will be able to account for their unequal length when we analyze the data.
 
@@ -223,7 +223,8 @@ d <- left_join (deaths, pop, by = 'year') %>%  # add total population
           share.65 = pop.65/pop*100, # calculate share of 65 to 80
           share.65plus = share.80 + share.65, # calculate share of 65+
           counter = year-2009 # a counter variable for the year
-          )
+          ) %>%
+  filter(year < 2021)
 ```
 
 # Annual mortality over time
@@ -595,25 +596,30 @@ nlw <- nlw$data %>%
   spread(datatype, temp)
 
 # aggregate at week level
-nlw.w <- read.zoo (nlw)
-nlw.w <- apply.weekly(nlw.w, mean, na.rm=T)
-nlw.w$week<-as.numeric(as.character(strftime(nlw.w,format = "%V")))
-nlw.w$year<-as.numeric(as.character(strftime(nlw.w,format = "%Y")))
+nlw.w <- nlw %>%
+  read.zoo()  %>%
+  apply.weekly(mean, na.rm=T) %>%
+  transform (year = as.numeric(as.character(strftime(.,format = "%Y"))),
+             week = as.numeric(as.character(strftime(.,format = "%V"))),
+             date = as.character(attributes(.)$index))
+
+# manually clean up some week nubmer issues
+nlw.w$id <- paste0(nlw.w$year, '.', trimws(nlw.w$week))
+nlw.w$id <- ifelse (nlw.w$date =='2017-01-01', '2016.52',nlw.w$id)
+nlw.w$id <- ifelse (nlw.w$date =='2012-01-01', '2011.52',nlw.w$id)
+nlw.w$id <- ifelse (nlw.w$date =='2011-01-02', '2010.52',nlw.w$id)
+
+nlw.w <- nlw.w[nlw.w$week!=53,]
 
 # transform variables 
 nlw.w  = data.frame(nlw.w) %>% 
   mutate (temp.max = round(as.numeric(as.character(TMAX)), 2),
           temp.min = round(as.numeric(as.character(TMIN)), 2),
-          id = paste0(year, '.', week),
-          id = case_when(id == '2010.53' ~ '2010.52', id == '2016.53' ~ '2016.52', TRUE ~ id) # recode weeks 53 to 52
+          t.min = case_when (temp.min>0 ~ 0, TRUE ~ 0-temp.min),
+          t.max = case_when (temp.max<20 ~ 0, TRUE ~temp.max-20)
           ) %>% 
-  dplyr::select (id, temp.max, temp.min) 
+  dplyr::select (id, temp.max, temp.min, t.min, t.max) 
 
-# create variables to use in the models
-nlw.w$t.min<-ifelse(nlw.w$temp.min>0, 0, 0-nlw.w$temp.min)
-nlw.w$t.max<-ifelse(nlw.w$temp.max<20, 0, nlw.w$temp.max-20)
-
-nlw.w<-nlw.w[-c(209,470),] # two observations need to be removed due to the way weeks are constructed
 ```
 
 Now we can attach the newly-acquired weather data to the rest of the data.
