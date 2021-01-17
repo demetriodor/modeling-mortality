@@ -864,8 +864,6 @@ d.eval <- d %>%
   filter (week > 0, week <= w) %>% 
   filter (year == 2020) 
 
-d.eval$n_days[52]<-0
-
 # Robust linear regression
 m4d<-rlm(deaths ~ sin(2*pi*week/52) + cos(2*pi*week/52) + share.65 + t.min + t.max + n_days, data=d.model, psi = psi.huber)
 summary(m4d)
